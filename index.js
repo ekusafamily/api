@@ -1,4 +1,3 @@
-
 import express from 'express';
 import cors from 'cors';
 import { createClient } from '@supabase/supabase-js';
@@ -28,88 +27,75 @@ app.get('/', (req, res) => {
 });
 
 // Callback Endpoint
+// Callback Endpoint
 app.post('/api/callback', async (req, res) => {
     console.log('----- M-PESA CALLBACK RECEIVED -----');
     console.log(JSON.stringify(req.body, null, 2));
 
-    const { Body } = req.body;
+    const { Body, response } = req.body;
 
-    if (!Body || !Body.stkCallback) {
-        return res.status(400).send('Invalid Callback format');
+    // 1. Handle Lipia Online Format (Priority)
+    if (response && response.Status === 'Success') {
+        const { MpesaReceiptNumber, Amount, ExternalReference, Phone } = response;
+        console.log(`✅ Lipia Payment Success! Receipt: ${MpesaReceiptNumber}, Order ID: ${ExternalReference}`);
+
+        // Update Order by ID (Direct Match!)
+        const { error: updateError } = await supabase
+            .from('orders')
+            .update({
+                payment_status: 'paid',
+                mpesa_receipt: MpesaReceiptNumber,
+                phone_number: Phone
+            })
+            .eq('id', ExternalReference);
+
+        if (updateError) console.error('Error updating order:', updateError);
+        else console.log('✅ Order updated to PAID!');
+
+        return res.json({ result: 'success' });
     }
 
-    const { ResultCode, ResultDesc, CallbackMetadata, MerchantRequestID, CheckoutRequestID } = Body.stkCallback;
+    // 2. Handle Standard Safaricom Format (Fallback)
+    if (Body && Body.stkCallback) {
+        const { ResultCode, ResultDesc, CallbackMetadata } = Body.stkCallback;
 
-    // External Reference was passed as 'order_<timestamp>' or 'test_<timestamp>'
-    // But M-Pesa doesn't always return our external reference in the main body easier.
-    // It returns MerchantRequestID and CheckoutRequestID.
-    // Ideally, we stored CheckoutRequestID in our database when we initiated payment.
-    // For this simple implementation, we might need to rely on matching by metadata (if available) or 
-    // we need to update our initiate logic to store the CheckoutRequestID returned by the initial API call.
+        if (ResultCode === 0) {
+            const amountItem = CallbackMetadata.Item.find(item => item.Name === 'Amount');
+            const mpesaReceiptItem = CallbackMetadata.Item.find(item => item.Name === 'MpesaReceiptNumber');
+            const phoneItem = CallbackMetadata.Item.find(item => item.Name === 'PhoneNumber');
 
-    // Let's assume for this MVP we just log it. 
-    // To properly update the order, we need to map M-Pesa's ID to our Order ID.
-    // STRATEGY CHECK: The initiate API response gave us `TransactionReference` (which might be CheckoutRequestID).
-    // Let's update our frontend to save that ID.
+            const amount = amountItem ? amountItem.Value : 0;
+            const mpesaReceipt = mpesaReceiptItem ? mpesaReceiptItem.Value : 'N/A';
+            const phone = phoneItem ? phoneItem.Value : 'N/A';
 
-    if (ResultCode === 0) {
-        // SUCCESS
-        const amountItem = CallbackMetadata.Item.find(item => item.Name === 'Amount');
-        const mpesaReceiptItem = CallbackMetadata.Item.find(item => item.Name === 'MpesaReceiptNumber');
-        const phoneItem = CallbackMetadata.Item.find(item => item.Name === 'PhoneNumber');
+            console.log(`✅ Standard Payment Success! Receipt: ${mpesaReceipt}, Amount: ${amount}`);
 
-        const amount = amountItem ? amountItem.Value : 0;
-        const mpesaReceipt = mpesaReceiptItem ? mpesaReceiptItem.Value : 'N/A';
-        const phone = phoneItem ? phoneItem.Value : 'N/A';
+            // Normalization & Fuzzy Match Logic
+            const last9Digits = phone.toString().slice(-9);
 
-        console.log(`✅ Payment Successful! Receipt: ${mpesaReceipt}, Amount: ${amount}`);
+            const { data: orders } = await supabase
+                .from('orders')
+                .select('*')
+                .eq('payment_status', 'pending')
+                .eq('total_amount', amount)
+                .order('created_at', { ascending: false })
+                .limit(1);
 
-        // Normalize Phone: M-Pesa sends 2547..., we might have stored 07...
-        // Let's try to match the last 9 digits to be safe
-        const last9Digits = phone.toString().slice(-9);
-
-        // Find the most recent pending order with matching amount AND phone number ending in...
-        const { data: orders, error: fetchError } = await supabase
-            .from('orders')
-            .select('*')
-            .eq('payment_status', 'pending')
-            .eq('total_amount', amount)
-            .order('created_at', { ascending: false })
-            .limit(1);
-
-        if (fetchError) {
-            console.error('Error fetching orders:', fetchError);
-        } else if (orders && orders.length > 0) {
-            // Check phone match manually since we don't have exact format guarantee
-            const order = orders.find(o => o.phone_number.includes(last9Digits));
-
-            if (order) {
-                console.log(`Found Matching Order: ${order.id}. Updating...`);
-                const { error: updateError } = await supabase
-                    .from('orders')
-                    .update({
-                        payment_status: 'paid',
-                        mpesa_receipt: mpesaReceipt
-                    })
-                    .eq('id', order.id);
-
-                if (updateError) console.error('Error updating order:', updateError);
-                else console.log('✅ Order updated to PAID!');
-            } else {
-                console.log('⚠️ Pending order found with matching amount, but phone number did not match.');
-                console.log(`Callback Phone: ${phone} (last 9: ${last9Digits})`);
-                console.log(`Order Phone: ${orders[0].phone_number}`);
+            if (orders && orders.length > 0) {
+                const order = orders.find(o => o.phone_number.includes(last9Digits));
+                if (order) {
+                    await supabase.from('orders').update({ payment_status: 'paid', mpesa_receipt: mpesaReceipt }).eq('id', order.id);
+                    console.log('✅ Order updated to PAID (Fuzzy Match)!');
+                }
             }
         } else {
-            console.log('⚠️ No matching pending order found for this payment.');
+            console.log(`❌ Payment Failed. Code: ${ResultCode}`);
         }
-
-    } else {
-        console.log(`❌ Payment Failed/Cancelled. Code: ${ResultCode}, Desc: ${ResultDesc}`);
-        // Optional: Update most recent pending order to 'failed' if we could match it
+        return res.json({ result: 'received' });
     }
 
-    res.json({ result: 'received' });
+    console.log('⚠️ Unknown Callback Format');
+    res.status(400).send('Unknown Format');
 });
 
 app.listen(PORT, () => {
